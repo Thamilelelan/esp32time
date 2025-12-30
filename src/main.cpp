@@ -2,9 +2,11 @@
 #include <WiFi.h>
 #include <BluetoothSerial.h>
 #include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <time.h>
+#include <Preferences.h>
 #include "credentials.h"
 
 //////////////////////
@@ -26,150 +28,245 @@ const int daylightOffset_sec = 0; // No daylight saving in India
 BluetoothSerial SerialBT;
 
 //////////////////////
-// OLED Display
+// Display (Auto-detect LCD or OLED)
 //////////////////////
+#define LCD_ADDRESS 0x27
+#define OLED_ADDRESS 0x3C
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
-#define SCREEN_ADDRESS 0x3C
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2);
+Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+enum DisplayType
+{
+  DISPLAY_NONE,
+  DISPLAY_LCD,
+  DISPLAY_OLED
+};
+DisplayType displayType = DISPLAY_NONE;
 
 String pcBuffer = "";
 String phoneBuffer = "";
 String lastPhoneMsg = "";
 unsigned long lastStatusMsg = 0;
 unsigned long lastDisplayUpdate = 0;
+unsigned long lastTimeSave = 0;
 bool btConnected = false;
-int scrollOffset = 0;
-unsigned long scrollStart = 0;
-bool scrolling = false;
 
-void updateDisplay()
+// NVS storage for persistent time
+Preferences preferences;
+
+//////////////////////
+// Icons for OLED (16x16 pixels)
+//////////////////////
+// WiFi Connected Icon
+const unsigned char wifi_icon[] PROGMEM = {
+    0x00, 0x00, 0x0f, 0xf0, 0x3f, 0xfc, 0x70, 0x0e, 0xe0, 0x07, 0xc7, 0xe3,
+    0x0f, 0xf0, 0x1c, 0x38, 0x30, 0x0c, 0x23, 0xc4, 0x07, 0xe0, 0x0c, 0x30,
+    0x04, 0x20, 0x01, 0x80, 0x01, 0x80, 0x00, 0x00};
+
+// WiFi Disconnected Icon (X mark)
+const unsigned char wifi_off_icon[] PROGMEM = {
+    0x00, 0x00, 0xc0, 0x03, 0xe0, 0x07, 0x70, 0x0e, 0x38, 0x1c, 0x1c, 0x38,
+    0x0e, 0x70, 0x07, 0xe0, 0x07, 0xe0, 0x0e, 0x70, 0x1c, 0x38, 0x38, 0x1c,
+    0x70, 0x0e, 0xe0, 0x07, 0xc0, 0x03, 0x00, 0x00};
+
+// Bluetooth Connected Icon
+const unsigned char bt_icon[] PROGMEM = {
+    0x00, 0x00, 0x01, 0x00, 0x01, 0x80, 0x11, 0x40, 0x09, 0x20, 0x05, 0x90,
+    0x03, 0xc8, 0x01, 0xe4, 0x01, 0xe4, 0x03, 0xc8, 0x05, 0x90, 0x09, 0x20,
+    0x11, 0x40, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00};
+
+// Bluetooth Disconnected Icon
+const unsigned char bt_off_icon[] PROGMEM = {
+    0x00, 0x00, 0x40, 0x02, 0x60, 0x06, 0x30, 0x0c, 0x18, 0x18, 0x0c, 0x30,
+    0x06, 0x60, 0x03, 0xc0, 0x03, 0xc0, 0x06, 0x60, 0x0c, 0x30, 0x18, 0x18,
+    0x30, 0x0c, 0x60, 0x06, 0x40, 0x02, 0x00, 0x00};
+
+void saveCurrentTime()
 {
-  display.clearDisplay();
+  time_t now;
+  time(&now);
+  if (now > 0)
+  {
+    preferences.begin("esp32time", false);
+    preferences.putULong64("savedTime", (uint64_t)now);
+    preferences.end();
+    Serial.print("Time saved to NVS: ");
+    Serial.println(now);
+  }
+  else
+  {
+    Serial.println("Cannot save time - time not set");
+  }
+}
 
-  // Time display (top line)
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
+void restoreSavedTime()
+{
+  preferences.begin("esp32time", true); // read-only
+  uint64_t savedTime = preferences.getULong64("savedTime", 0);
+  preferences.end();
 
+  if (savedTime > 0)
+  {
+    struct timeval tv;
+    tv.tv_sec = savedTime;
+    tv.tv_usec = 0;
+    settimeofday(&tv, NULL);
+    Serial.print("Time restored from NVS: ");
+    Serial.println((time_t)savedTime);
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo))
+    {
+      char buffer[64];
+      strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+      Serial.print("Restored time: ");
+      Serial.println(buffer);
+    }
+  }
+  else
+  {
+    Serial.println("No saved time found in NVS");
+  }
+}
+
+void updateDisplayLCD()
+{
   struct tm timeinfo;
-  if (getLocalTime(&timeinfo))
+  bool hasTime = getLocalTime(&timeinfo);
+
+  char line0[17] = "                ";
+  char line1[17] = "                ";
+
+  // Line 0: Time and WiFi and BT
+  if (hasTime)
   {
-    char timeStr[20];
-    strftime(timeStr, sizeof(timeStr), "%I:%M:%S %p", &timeinfo);
-    display.print(timeStr);
+    char timeStr[9];
+    strftime(timeStr, sizeof(timeStr), "%I:%M%p", &timeinfo);
+    snprintf(line0, sizeof(line0), "%s W:%s BT:%s",
+             timeStr,
+             WiFi.status() == WL_CONNECTED ? "OK" : "X",
+             SerialBT.hasClient() ? "OK" : "X");
   }
   else
   {
-    display.print("--:--:--");
+    snprintf(line0, sizeof(line0), "--:-- W:%s BT:%s",
+             WiFi.status() == WL_CONNECTED ? "OK" : "X",
+             SerialBT.hasClient() ? "OK" : "X");
   }
 
-  // WiFi status (same line, right side)
-  display.print(" ");
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    display.println("WiFi:OK");
-  }
-  else
-  {
-    display.println("WiFi:X");
-  }
-
-  // Date display (second line)
-  display.setCursor(0, 10);
-  struct tm timeinfo2;
-  if (getLocalTime(&timeinfo2))
-  {
-    char dateStr[25];
-    strftime(dateStr, sizeof(dateStr), "%a, %b %d %Y", &timeinfo2);
-    display.print(dateStr);
-  }
-  else
-  {
-    display.print("Date: N/A");
-  }
-
-  // Bluetooth status
-  display.setCursor(0, 20);
-  display.print("BT: ");
-  if (SerialBT.hasClient())
-  {
-    display.println("CONNECTED");
-    btConnected = true;
-  }
-  else
-  {
-    display.println("waiting...");
-    btConnected = false;
-  }
-
-  // Phone message display
-  display.setCursor(0, 30);
+  // Line 1: Message
+  btConnected = SerialBT.hasClient();
   if (lastPhoneMsg.length() > 0 && btConnected)
   {
-    display.print("NEW MSG: ");
+    snprintf(line1, sizeof(line1), "%.16s", lastPhoneMsg.c_str());
+  }
+  else
+  {
+    snprintf(line1, sizeof(line1), "Ready...");
+  }
 
-    String msgToShow = lastPhoneMsg;
-    int msgLen = msgToShow.length();
+  lcd.setCursor(0, 0);
+  lcd.print(line0);
+  lcd.setCursor(0, 1);
+  lcd.print(line1);
+}
 
-    if (msgLen > 18 && scrolling)
+void updateDisplayOLED()
+{
+  struct tm timeinfo;
+  bool hasTime = getLocalTime(&timeinfo);
+
+  oled.clearDisplay();
+  oled.setTextSize(2);
+  oled.setTextColor(SSD1306_WHITE);
+
+  // First line: Time + WiFi icon + BT icon
+  // Format: "HH:MM [W][B]"
+  oled.setCursor(0, 0);
+  if (hasTime)
+  {
+    char timeStr[8];
+    strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+    oled.print(timeStr);
+  }
+  else
+  {
+    oled.print("--:--");
+  }
+
+  // WiFi icon (16x16 at position after time)
+  btConnected = SerialBT.hasClient();
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    oled.drawBitmap(80, 0, wifi_icon, 16, 16, SSD1306_WHITE);
+  }
+  else
+  {
+    oled.drawBitmap(80, 0, wifi_off_icon, 16, 16, SSD1306_WHITE);
+  }
+
+  // Bluetooth icon (16x16 next to WiFi icon)
+  if (btConnected)
+  {
+    oled.drawBitmap(104, 0, bt_icon, 16, 16, SSD1306_WHITE);
+  }
+  else
+  {
+    oled.drawBitmap(104, 0, bt_off_icon, 16, 16, SSD1306_WHITE);
+  }
+
+  // Rest of screen for additional info
+  oled.setTextSize(1);
+
+  // Line 2: WiFi IP if connected
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    oled.setCursor(0, 20);
+    oled.print("IP: ");
+    oled.println(WiFi.localIP());
+  }
+
+  // Line 3+: Messages
+  if (lastPhoneMsg.length() > 0 && btConnected)
+  {
+    oled.setCursor(0, 32);
+    oled.println("Message:");
+    oled.setCursor(0, 44);
+    // Word wrap for long messages
+    if (lastPhoneMsg.length() > 21)
     {
-      int displayLen = 18;
-      String visible = msgToShow.substring(scrollOffset, scrollOffset + displayLen);
-      if (scrollOffset + displayLen > msgLen)
-      {
-        visible += " " + msgToShow.substring(0, scrollOffset + displayLen - msgLen);
-      }
-      display.println(visible);
-
-      if (millis() - scrollStart > 8000)
-      {
-        scrollOffset = 0;
-        scrolling = false;
-      }
+      oled.println(lastPhoneMsg.substring(0, 21));
+      oled.setCursor(0, 54);
+      oled.println(lastPhoneMsg.substring(21, 42));
     }
     else
     {
-      if (msgLen > 18)
-      {
-        display.println(msgToShow.substring(0, 18) + "...");
-      }
-      else
-      {
-        display.println(msgToShow);
-      }
+      oled.println(lastPhoneMsg);
     }
   }
-  else
+  else if (btConnected)
   {
-    display.println("No messages yet");
+    oled.setCursor(0, 40);
+    oled.println("Ready for messages...");
   }
 
-  // PC buffer
-  display.setCursor(0, 48);
-  display.print("PC> ");
-  if (pcBuffer.length() > 0)
-  {
-    display.println(pcBuffer.substring(0, 14));
-  }
-  else
-  {
-    display.println("ready");
-  }
+  oled.display();
+}
 
-  // Status
-  display.setCursor(0, 56);
-  if (millis() - lastStatusMsg < 5000 && btConnected)
+void updateDisplay()
+{
+  if (displayType == DISPLAY_LCD)
   {
-    display.println("Status sent!");
+    updateDisplayLCD();
   }
-  else
+  else if (displayType == DISPLAY_OLED)
   {
-    display.println("Ready");
+    updateDisplayOLED();
   }
-
-  display.display();
 }
 
 void setup()
@@ -177,212 +274,204 @@ void setup()
   Serial.begin(115200);
   delay(1000);
 
+  Serial.println("\n=== ESP32 WiFi+BT Project ===");
   Serial.print("WiFi SSID: ");
   Serial.println(ssid ? ssid : "NOT SET");
-  Serial.print("WiFi PASS: ");
-  Serial.println(strlen(password) > 0 ? "***SET***" : "NOT SET");
 
-  // Initialize OLED
-  Wire.begin(21, 22);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS))
+  // Restore saved time from NVS (before WiFi)
+  Serial.println("\n=== Restoring Time from NVS ===");
+  restoreSavedTime();
+
+  // Initialize I2C
+  Serial.println("\n=== Detecting Display ===");
+  Wire.begin(21, 22); // SDA=GPIO21, SCL=GPIO22
+
+  // Check for OLED at 0x3C
+  Wire.beginTransmission(OLED_ADDRESS);
+  if (Wire.endTransmission() == 0)
   {
-    Serial.println(F("OLED init FAILED"));
-    for (;;)
-      ;
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("ESP32 Starting...");
-  display.println("BT: ESP32-WIFI-BT");
-  display.display();
-  delay(1500);
+    Serial.println("OLED detected at 0x3C!");
+    displayType = DISPLAY_OLED;
 
-  // Wi-Fi
-  Serial.println("\n=== WiFi Scan Starting ===");
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
-
-  // Scan for networks to see if router is visible
-  int n = WiFi.scanNetworks();
-  Serial.println("Scan complete");
-  if (n == 0)
-  {
-    Serial.println("No networks found");
+    if (oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS))
+    {
+      Serial.println("OLED initialized!");
+      oled.clearDisplay();
+      oled.setTextSize(1);
+      oled.setTextColor(SSD1306_WHITE);
+      oled.setCursor(0, 0);
+      oled.println("ESP32 Starting...");
+      oled.setCursor(0, 16);
+      oled.println("OLED Mode!");
+      oled.display();
+      delay(2000);
+    }
+    else
+    {
+      Serial.println("OLED init failed!");
+      displayType = DISPLAY_NONE;
+    }
   }
+  // Check for LCD at 0x27
   else
   {
-    Serial.printf("%d networks found:\n", n);
-    bool foundOurSSID = false;
-    for (int i = 0; i < n; ++i)
+    Wire.beginTransmission(LCD_ADDRESS);
+    if (Wire.endTransmission() == 0)
     {
-      bool isOurNetwork = (WiFi.SSID(i) == String(ssid));
-      if (isOurNetwork)
-        foundOurSSID = true;
+      Serial.println("LCD detected at 0x27!");
+      displayType = DISPLAY_LCD;
 
-      Serial.printf("%d: %s (%d dBm) Ch:%d %s %s\n",
-                    i + 1,
-                    WiFi.SSID(i).c_str(),
-                    WiFi.RSSI(i),
-                    WiFi.channel(i),
-                    (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "OPEN" : "ENC",
-                    isOurNetwork ? " <- TARGET" : "");
+      lcd.init();
+      lcd.backlight();
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("ESP32 Starting..");
+      lcd.setCursor(0, 1);
+      lcd.print("LCD I2C Mode!");
+
+      Serial.println("LCD initialized!");
+      Serial.println("*** If you see backlight but NO text:");
+      Serial.println("1. SOLDER the 4 I2C module pins");
+      Serial.println("2. Or use jumper wires directly to I2C module pins");
+      Serial.println("3. Adjust contrast pot on I2C module (blue box with grey screw)");
+      delay(2000);
     }
-    if (!foundOurSSID)
+    else
     {
-      Serial.println("WARNING: Target SSID not found in scan!");
+      Serial.println("No display found on I2C bus!");
+      displayType = DISPLAY_NONE;
     }
   }
 
-  Serial.println("\n=== Connecting to Wi-Fi ===");
-  Serial.print("SSID: ");
-  Serial.println(ssid);
+  // Wi-Fi
+  Serial.println("\n=== Connecting to WiFi ===");
+  if (displayType == DISPLAY_LCD)
+  {
+    lcd.clear();
+    lcd.print("WiFi connect...");
+  }
+  else if (displayType == DISPLAY_OLED)
+  {
+    oled.clearDisplay();
+    oled.setCursor(0, 0);
+    oled.println("WiFi connecting...");
+    oled.display();
+  }
 
-  display.clearDisplay();
-  display.println("WiFi connecting...");
-  display.display();
-
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
+
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30)
+  while (WiFi.status() != WL_CONNECTED && attempts < 20)
   {
     delay(500);
     Serial.print(".");
-    display.print(".");
-    display.display();
-    attempts++;
-
-    // Print WiFi status for debugging
-    if (attempts % 5 == 0)
+    if (displayType == DISPLAY_LCD)
     {
-      Serial.print("\nAttempt ");
-      Serial.print(attempts);
-      Serial.print(" - Status: ");
-      switch (WiFi.status())
-      {
-      case WL_IDLE_STATUS:
-        Serial.println("IDLE");
-        break;
-      case WL_NO_SSID_AVAIL:
-        Serial.println("NO_SSID_AVAIL");
-        break;
-      case WL_SCAN_COMPLETED:
-        Serial.println("SCAN_COMPLETED");
-        break;
-      case WL_CONNECTED:
-        Serial.println("CONNECTED");
-        break;
-      case WL_CONNECT_FAILED:
-        Serial.println("CONNECT_FAILED");
-        break;
-      case WL_CONNECTION_LOST:
-        Serial.println("CONNECTION_LOST");
-        break;
-      case WL_DISCONNECTED:
-        Serial.println("DISCONNECTED");
-        break;
-      default:
-        Serial.printf("UNKNOWN(%d)\n", WiFi.status());
-        break;
-      }
+      lcd.print(".");
     }
+    attempts++;
   }
 
   if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.println("\n=== Wi-Fi Connected ===");
+    Serial.println("\nWiFi connected!");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
-    Serial.print("Gateway: ");
-    Serial.println(WiFi.gatewayIP());
-    Serial.print("Channel: ");
-    Serial.println(WiFi.channel());
-    Serial.print("Signal: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
 
-    // Initialize time from NTP
-    Serial.println("\n=== Setting up Time ===");
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    Serial.print("Syncing with NTP server...");
-
-    struct tm timeinfo;
-    int retries = 0;
-    while (!getLocalTime(&timeinfo) && retries < 10)
+    if (displayType == DISPLAY_LCD)
     {
-      Serial.print(".");
-      delay(500);
-      retries++;
+      lcd.clear();
+      lcd.print("WiFi OK!");
+      lcd.setCursor(0, 1);
+      lcd.print(WiFi.localIP());
     }
+    else if (displayType == DISPLAY_OLED)
+    {
+      oled.clearDisplay();
+      oled.setCursor(0, 0);
+      oled.println("WiFi Connected!");
+      oled.setCursor(0, 16);
+      oled.print("IP: ");
+      oled.println(WiFi.localIP());
+      oled.display();
+    }
+    delay(2000);
+
+    // Setup time
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    Serial.println("Time sync started");
+
+    // Wait for time to be set
+    delay(2000);
+    struct tm timeinfo;
     if (getLocalTime(&timeinfo))
     {
-      Serial.println("\nTime synchronized!");
-      Serial.print("Current time: ");
-      Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
-    }
-    else
-    {
-      Serial.println("\nFailed to sync time");
+      Serial.println("NTP time synced successfully!");
+      saveCurrentTime(); // Save to NVS
     }
   }
   else
   {
-    Serial.println("\n=== Wi-Fi FAILED ===");
-    Serial.print("Final Status: ");
-    switch (WiFi.status())
+    Serial.println("\nWiFi FAILED");
+    if (displayType == DISPLAY_LCD)
     {
-    case WL_NO_SSID_AVAIL:
-      Serial.println("NO_SSID_AVAIL - Router not found or wrong channel");
-      Serial.println("FIX: Check router channel (use 1-11), enable SSID broadcast");
-      break;
-    case WL_CONNECT_FAILED:
-      Serial.println("CONNECT_FAILED - Wrong password or auth issue");
-      Serial.println("FIX: Verify password, check router security (use WPA2, not WPA3-only)");
-      break;
-    case WL_DISCONNECTED:
-      Serial.println("DISCONNECTED - Connection rejected");
-      Serial.println("FIX: Router settings - try channel 1/6/11, 20MHz width, 802.11bgn mode");
-      break;
-    default:
-      Serial.printf("UNKNOWN(%d)\n", WiFi.status());
-      break;
+      lcd.clear();
+      lcd.print("WiFi FAILED!");
     }
+    else if (displayType == DISPLAY_OLED)
+    {
+      oled.clearDisplay();
+      oled.setCursor(0, 0);
+      oled.println("WiFi FAILED!");
+      oled.display();
+    }
+    delay(2000);
   }
-  updateDisplay();
 
   // Bluetooth
   SerialBT.begin("ESP32-WIFI-BT");
   Serial.println("Bluetooth ready - pair with 'ESP32-WIFI-BT'");
+
+  if (displayType == DISPLAY_LCD)
+  {
+    lcd.clear();
+    lcd.print("BT: Ready!");
+  }
+  else if (displayType == DISPLAY_OLED)
+  {
+    oled.clearDisplay();
+    oled.setCursor(0, 0);
+    oled.println("Bluetooth Ready!");
+    oled.setCursor(0, 16);
+    oled.println("ESP32-WIFI-BT");
+    oled.display();
+  }
+  delay(2000);
+
   updateDisplay();
 }
 
 void loop()
 {
-  if (millis() - lastDisplayUpdate > 200)
+  // Update display every second
+  if (millis() - lastDisplayUpdate > 1000)
   {
     updateDisplay();
     lastDisplayUpdate = millis();
   }
 
-  if (scrolling && lastPhoneMsg.length() > 18)
+  // Save time to NVS every 60 seconds
+  if (millis() - lastTimeSave > 60000)
   {
-    if (millis() - scrollStart > 300)
-    {
-      scrollOffset++;
-      if (scrollOffset > lastPhoneMsg.length())
-      {
-        scrollOffset = 0;
-      }
-      scrollStart = millis();
-    }
+    saveCurrentTime();
+    lastTimeSave = millis();
   }
 
+  // Send status message every 5 seconds if BT connected
   if (SerialBT.hasClient() && (millis() - lastStatusMsg > 5000))
   {
-    SerialBT.println("ESP32 READY - Send messages!");
-    Serial.println("Status sent to phone");
+    SerialBT.println("ESP32 READY");
     lastStatusMsg = millis();
   }
 
@@ -418,12 +507,9 @@ void loop()
       if (phoneBuffer.length() > 0)
       {
         lastPhoneMsg = phoneBuffer;
-        scrollOffset = 0;
-        scrolling = (phoneBuffer.length() > 18);
-        scrollStart = millis();
-
         Serial.println("PHONE MSG: " + phoneBuffer);
         phoneBuffer = "";
+        updateDisplay(); // Update immediately when new message arrives
       }
     }
     else

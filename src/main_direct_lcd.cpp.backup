@@ -1,0 +1,180 @@
+#include <Arduino.h>
+#include <LiquidCrystal.h>  // Standard Arduino LCD library (no I2C)
+#include <WiFi.h>
+#include <BluetoothSerial.h>
+#include <time.h>
+#include "credentials.h"
+
+//////////////////////
+// Wi-Fi settings
+//////////////////////
+const char *ssid = WIFI_SSID;
+const char *password = WIFI_PASSWORD;
+
+//////////////////////
+// Time settings
+//////////////////////
+const char *ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 19800;
+const int daylightOffset_sec = 0;
+
+//////////////////////
+// Bluetooth
+//////////////////////
+BluetoothSerial SerialBT;
+
+//////////////////////
+// LCD Direct Connection (NO I2C)
+// Wiring:
+// LCD RS  -> GPIO 19
+// LCD EN  -> GPIO 23
+// LCD D4  -> GPIO 18
+// LCD D5  -> GPIO 17
+// LCD D6  -> GPIO 16
+// LCD D7  -> GPIO 15
+// LCD VSS -> GND
+// LCD VDD -> 5V
+// LCD V0  -> 10K pot to GND (contrast)
+// LCD RW  -> GND
+// LCD A   -> 5V (backlight +)
+// LCD K   -> GND (backlight -)
+//////////////////////
+const int rs = 19, en = 23, d4 = 18, d5 = 17, d6 = 16, d7 = 15;
+LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
+
+String pcBuffer = "";
+String phoneBuffer = "";
+String lastPhoneMsg = "";
+unsigned long lastStatusMsg = 0;
+unsigned long lastDisplayUpdate = 0;
+bool btConnected = false;
+
+void updateDisplay() {
+  struct tm timeinfo;
+  bool hasTime = getLocalTime(&timeinfo);
+  
+  char line0[17] = "                ";
+  char line1[17] = "                ";
+  
+  // Line 0: Time and WiFi and BT
+  if (hasTime) {
+    char timeStr[9];
+    strftime(timeStr, sizeof(timeStr), "%I:%M%p", &timeinfo);
+    snprintf(line0, sizeof(line0), "%s W:%s BT:%s", 
+             timeStr, 
+             WiFi.status() == WL_CONNECTED ? "OK" : "X",
+             SerialBT.hasClient() ? "OK" : "X");
+  } else {
+    snprintf(line0, sizeof(line0), "--:-- W:%s BT:%s",
+             WiFi.status() == WL_CONNECTED ? "OK" : "X",
+             SerialBT.hasClient() ? "OK" : "X");
+  }
+  
+  // Line 1: Message
+  btConnected = SerialBT.hasClient();
+  if (lastPhoneMsg.length() > 0 && btConnected) {
+    snprintf(line1, sizeof(line1), "%.16s", lastPhoneMsg.c_str());
+  } else {
+    snprintf(line1, sizeof(line1), "Ready...");
+  }
+  
+  lcd.setCursor(0, 0);
+  lcd.print(line0);
+  lcd.setCursor(0, 1);
+  lcd.print(line1);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n=== ESP32 LCD Direct Connection ===");
+  Serial.print("WiFi SSID: ");
+  Serial.println(ssid);
+  
+  // Initialize LCD
+  Serial.println("Initializing LCD (direct connection)...");
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("ESP32 Starting..");
+  lcd.setCursor(0, 1);
+  lcd.print("Direct LCD Mode");
+  
+  Serial.println("LCD initialized");
+  Serial.println("You should see text on LCD now!");
+  Serial.println("If not, adjust the contrast pot (V0 pin)");
+  
+  delay(2000);
+  
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  lcd.clear();
+  lcd.print("WiFi connect...");
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    
+    // Setup time
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  }
+  
+  // Bluetooth
+  SerialBT.begin("ESP32-LCD-BT");
+  Serial.println("Bluetooth ready");
+  
+  updateDisplay();
+}
+
+void loop() {
+  if (millis() - lastDisplayUpdate > 1000) {
+    updateDisplay();
+    lastDisplayUpdate = millis();
+  }
+  
+  if (SerialBT.hasClient() && (millis() - lastStatusMsg > 5000)) {
+    SerialBT.println("ESP32 READY");
+    lastStatusMsg = millis();
+  }
+  
+  // PC Serial -> Phone BT
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (pcBuffer.length() > 0) {
+        SerialBT.println(pcBuffer);
+        Serial.println("PC->BT: " + pcBuffer);
+        pcBuffer = "";
+      }
+    } else {
+      pcBuffer += c;
+    }
+  }
+  
+  // Phone BT -> PC Serial
+  while (SerialBT.available()) {
+    char c = SerialBT.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (phoneBuffer.length() > 0) {
+        lastPhoneMsg = phoneBuffer;
+        Serial.println("PHONE: " + phoneBuffer);
+        phoneBuffer = "";
+      }
+    } else {
+      phoneBuffer += c;
+    }
+  }
+}
