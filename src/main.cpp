@@ -48,6 +48,8 @@ DisplayType displayType = DISPLAY_NONE;
 ChronosESP32 Chronos("ESP32-Nav");
 
 unsigned long lastDisplayUpdate = 0;
+unsigned long lastValidNavTime = 0; // Track when we last had valid navigation data
+bool wasNavigating = false;         // Remember if we were navigating
 unsigned long lastTimeSave = 0;
 
 // NVS storage for persistent time
@@ -241,8 +243,21 @@ void updateDisplayOLED()
   // Get navigation data from Chronos
   Navigation nav = Chronos.getNavigation();
 
-  // Show navigation if Chronos sends any navigation data (let Chronos handle state transitions)
-  if (Chronos.isConnected() && (nav.active || nav.distance != "" || nav.directions != "" || nav.title != ""))
+  // Check if we have valid navigation data
+  bool hasNavData = (nav.active || nav.distance != "" || nav.directions != "" || nav.title != "");
+
+  // Update navigation state tracking
+  if (hasNavData)
+  {
+    lastValidNavTime = millis();
+    wasNavigating = true;
+  }
+
+  // Show navigation if we have data OR if we were navigating recently (within 10 seconds)
+  // This prevents flickering to "Start navigation" during rerouting/road closure alerts
+  bool showNavigation = Chronos.isConnected() && (hasNavData || (wasNavigating && (millis() - lastValidNavTime < 10000)));
+
+  if (showNavigation)
   {
     oled.setTextSize(1);
 
@@ -332,6 +347,12 @@ void updateDisplayOLED()
     oled.println(Chronos.getAppVersion());
     oled.setCursor(0, 52);
     oled.println("Start navigation...");
+
+    // Reset navigation state when on idle screen for more than 10 seconds
+    if (millis() - lastValidNavTime > 10000)
+    {
+      wasNavigating = false;
+    }
   }
   else
   {
