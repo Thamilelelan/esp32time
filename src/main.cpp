@@ -1,12 +1,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <BluetoothSerial.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <time.h>
 #include <Preferences.h>
+#include <ChronosESP32.h>
 #include "credentials.h"
 
 //////////////////////
@@ -20,12 +20,7 @@ const char *password = WIFI_PASSWORD;
 //////////////////////
 const char *ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 19800; // GMT+5:30 for India (5.5 hours * 3600)
-const int daylightOffset_sec = 0; // No daylight saving in India
-
-//////////////////////
-// Bluetooth
-//////////////////////
-BluetoothSerial SerialBT;
+const int daylightOffset_sec = 0;
 
 //////////////////////
 // Display (Auto-detect LCD or OLED)
@@ -47,13 +42,13 @@ enum DisplayType
 };
 DisplayType displayType = DISPLAY_NONE;
 
-String pcBuffer = "";
-String phoneBuffer = "";
-String lastPhoneMsg = "";
-unsigned long lastStatusMsg = 0;
+//////////////////////
+// ChronosESP32 BLE
+//////////////////////
+ChronosESP32 Chronos("ESP32-Nav");
+
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastTimeSave = 0;
-bool btConnected = false;
 
 // NVS storage for persistent time
 Preferences preferences;
@@ -85,6 +80,98 @@ const unsigned char bt_off_icon[] PROGMEM = {
     0x06, 0x60, 0x03, 0xc0, 0x03, 0xc0, 0x06, 0x60, 0x0c, 0x30, 0x18, 0x18,
     0x30, 0x0c, 0x60, 0x06, 0x40, 0x02, 0x00, 0x00};
 
+// Navigation Arrow Icons (24x24)
+const unsigned char arrow_up[] PROGMEM = {
+    0x00, 0x18, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x7e, 0x00, 0x00, 0xff, 0x00,
+    0x01, 0xff, 0x80, 0x03, 0xff, 0xc0, 0x07, 0xe7, 0xe0, 0x00, 0x18, 0x00,
+    0x00, 0x18, 0x00, 0x00, 0x18, 0x00, 0x00, 0x18, 0x00, 0x00, 0x18, 0x00,
+    0x00, 0x18, 0x00, 0x00, 0x18, 0x00, 0x00, 0x18, 0x00, 0x00, 0x18, 0x00,
+    0x00, 0x18, 0x00, 0x00, 0x18, 0x00, 0x00, 0x18, 0x00, 0x00, 0x18, 0x00,
+    0x00, 0x18, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+const unsigned char arrow_left[] PROGMEM = {
+    0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0xf0, 0x00, 0x01, 0xf8, 0x00,
+    0x03, 0xfc, 0x00, 0x07, 0xfe, 0x00, 0x0f, 0xff, 0x00, 0x1f, 0xff, 0x80,
+    0x3f, 0xff, 0xc0, 0x7f, 0xff, 0xe0, 0x3f, 0xff, 0xc0, 0x1f, 0xff, 0x80,
+    0x0f, 0xff, 0x00, 0x07, 0xfe, 0x00, 0x03, 0xfc, 0x00, 0x01, 0xf8, 0x00,
+    0x00, 0xf0, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+const unsigned char arrow_right[] PROGMEM = {
+    0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x1f, 0x80,
+    0x00, 0x3f, 0xc0, 0x00, 0x7f, 0xe0, 0x00, 0xff, 0xf0, 0x01, 0xff, 0xf8,
+    0x03, 0xff, 0xfc, 0x07, 0xff, 0xfe, 0x03, 0xff, 0xfc, 0x01, 0xff, 0xf8,
+    0x00, 0xff, 0xf0, 0x00, 0x7f, 0xe0, 0x00, 0x3f, 0xc0, 0x00, 0x1f, 0x80,
+    0x00, 0x0f, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+// Large Navigation Arrows (48x48) for prominent display
+const unsigned char arrow_up_large[] PROGMEM = {
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x03, 0xFF, 0xC0, 0x00, 0x00,
+    0x00, 0x07, 0xFF, 0xE0, 0x00, 0x00, 0x00, 0x0F, 0xFF, 0xF0, 0x00, 0x00,
+    0x00, 0x1F, 0xFF, 0xF8, 0x00, 0x00, 0x00, 0x3F, 0xFF, 0xFC, 0x00, 0x00,
+    0x00, 0x7F, 0xFF, 0xFE, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0x00,
+    0x01, 0xFF, 0xFF, 0xFF, 0x80, 0x00, 0x03, 0xFF, 0xFF, 0xFF, 0xC0, 0x00,
+    0x07, 0xFF, 0xFF, 0xFF, 0xE0, 0x00, 0x0F, 0xFF, 0xFF, 0xFF, 0xF0, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00};
+
+const unsigned char arrow_left_large[] PROGMEM = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x03, 0xFF, 0x00, 0x00, 0x00,
+    0x00, 0x0F, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x3F, 0xFF, 0x00, 0x00, 0x00,
+    0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x03, 0xFF, 0xFF, 0x00, 0x00, 0x00,
+    0x0F, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x3F, 0xFF, 0xFF, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x3F, 0xFF, 0xFF, 0x00, 0x00, 0x00,
+    0x0F, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x03, 0xFF, 0xFF, 0x00, 0x00, 0x00,
+    0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x3F, 0xFF, 0x00, 0x00, 0x00,
+    0x00, 0x0F, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x03, 0xFF, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+const unsigned char arrow_right_large[] PROGMEM = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xC0, 0x00,
+    0x00, 0x00, 0x00, 0xFF, 0xF0, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFC, 0x00,
+    0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xC0,
+    0x00, 0x00, 0x00, 0xFF, 0xFF, 0xF0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFC,
+    0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFC,
+    0x00, 0x00, 0x00, 0xFF, 0xFF, 0xF0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xC0,
+    0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFC, 0x00,
+    0x00, 0x00, 0x00, 0xFF, 0xF0, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xC0, 0x00,
+    0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
 void saveCurrentTime()
 {
   time_t now;
@@ -94,18 +181,12 @@ void saveCurrentTime()
     preferences.begin("esp32time", false);
     preferences.putULong64("savedTime", (uint64_t)now);
     preferences.end();
-    Serial.print("Time saved to NVS: ");
-    Serial.println(now);
-  }
-  else
-  {
-    Serial.println("Cannot save time - time not set");
   }
 }
 
 void restoreSavedTime()
 {
-  preferences.begin("esp32time", true); // read-only
+  preferences.begin("esp32time", true);
   uint64_t savedTime = preferences.getULong64("savedTime", 0);
   preferences.end();
 
@@ -115,58 +196,35 @@ void restoreSavedTime()
     tv.tv_sec = savedTime;
     tv.tv_usec = 0;
     settimeofday(&tv, NULL);
-    Serial.print("Time restored from NVS: ");
-    Serial.println((time_t)savedTime);
-
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo))
-    {
-      char buffer[64];
-      strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
-      Serial.print("Restored time: ");
-      Serial.println(buffer);
-    }
-  }
-  else
-  {
-    Serial.println("No saved time found in NVS");
   }
 }
 
 void updateDisplayLCD()
 {
-  struct tm timeinfo;
-  bool hasTime = getLocalTime(&timeinfo);
-
   char line0[17] = "                ";
   char line1[17] = "                ";
 
-  // Line 0: Time and WiFi and BT
-  if (hasTime)
-  {
-    char timeStr[9];
-    strftime(timeStr, sizeof(timeStr), "%I:%M%p", &timeinfo);
-    snprintf(line0, sizeof(line0), "%s W:%s BT:%s",
-             timeStr,
-             WiFi.status() == WL_CONNECTED ? "OK" : "X",
-             SerialBT.hasClient() ? "OK" : "X");
-  }
-  else
-  {
-    snprintf(line0, sizeof(line0), "--:-- W:%s BT:%s",
-             WiFi.status() == WL_CONNECTED ? "OK" : "X",
-             SerialBT.hasClient() ? "OK" : "X");
-  }
+  // Line 0: Time and connection status
+  String timeStr = Chronos.getHourZ() + ":" + (Chronos.getHourC() < 10 ? "0" : "") + String(Chronos.getHourC());
+  snprintf(line0, sizeof(line0), "%s W:%s BT:%s",
+           timeStr.c_str(),
+           WiFi.status() == WL_CONNECTED ? "OK" : "X",
+           Chronos.isConnected() ? "OK" : "X");
 
-  // Line 1: Message
-  btConnected = SerialBT.hasClient();
-  if (lastPhoneMsg.length() > 0 && btConnected)
+  // Line 1: Navigation or status
+  Navigation nav = Chronos.getNavigation();
+  if (Chronos.isConnected() && nav.active && nav.directions != "")
   {
-    snprintf(line1, sizeof(line1), "%.16s", lastPhoneMsg.c_str());
+    // nav.distance is already a String like "250m" or "1.5km"
+    snprintf(line1, sizeof(line1), "%s %.8s", nav.distance.c_str(), nav.directions.c_str());
+  }
+  else if (Chronos.isConnected())
+  {
+    snprintf(line1, sizeof(line1), "Connected!");
   }
   else
   {
-    snprintf(line1, sizeof(line1), "Ready...");
+    snprintf(line1, sizeof(line1), "Wait Chronos...");
   }
 
   lcd.setCursor(0, 0);
@@ -177,81 +235,112 @@ void updateDisplayLCD()
 
 void updateDisplayOLED()
 {
-  struct tm timeinfo;
-  bool hasTime = getLocalTime(&timeinfo);
-
   oled.clearDisplay();
-  oled.setTextSize(2);
   oled.setTextColor(SSD1306_WHITE);
 
-  // First line: Time + WiFi icon + BT icon
-  // Format: "HH:MM [W][B]"
-  oled.setCursor(0, 0);
-  if (hasTime)
-  {
-    char timeStr[8];
-    strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
-    oled.print(timeStr);
-  }
-  else
-  {
-    oled.print("--:--");
-  }
+  // Get navigation data from Chronos
+  Navigation nav = Chronos.getNavigation();
 
-  // WiFi icon (16x16 at position after time)
-  btConnected = SerialBT.hasClient();
-  if (WiFi.status() == WL_CONNECTED)
+  // Show navigation if Chronos sends any navigation data (let Chronos handle state transitions)
+  if (Chronos.isConnected() && (nav.active || nav.distance != "" || nav.directions != "" || nav.title != ""))
   {
-    oled.drawBitmap(80, 0, wifi_icon, 16, 16, SSD1306_WHITE);
-  }
-  else
-  {
-    oled.drawBitmap(80, 0, wifi_off_icon, 16, 16, SSD1306_WHITE);
-  }
+    oled.setTextSize(1);
 
-  // Bluetooth icon (16x16 next to WiFi icon)
-  if (btConnected)
-  {
-    oled.drawBitmap(104, 0, bt_icon, 16, 16, SSD1306_WHITE);
-  }
-  else
-  {
-    oled.drawBitmap(104, 0, bt_off_icon, 16, 16, SSD1306_WHITE);
-  }
-
-  // Rest of screen for additional info
-  oled.setTextSize(1);
-
-  // Line 2: WiFi IP if connected
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    oled.setCursor(0, 20);
-    oled.print("IP: ");
-    oled.println(WiFi.localIP());
-  }
-
-  // Line 3+: Messages
-  if (lastPhoneMsg.length() > 0 && btConnected)
-  {
-    oled.setCursor(0, 32);
-    oled.println("Message:");
-    oled.setCursor(0, 44);
-    // Word wrap for long messages
-    if (lastPhoneMsg.length() > 21)
+    // ETA (top left, small)
+    if (nav.eta != "")
     {
-      oled.println(lastPhoneMsg.substring(0, 21));
-      oled.setCursor(0, 54);
-      oled.println(lastPhoneMsg.substring(21, 42));
+      oled.setCursor(0, 0);
+      oled.print(nav.eta.substring(0, min(8, (int)nav.eta.length())));
+    }
+
+    // TITLE (top right, large) - Distance to next turn
+    oled.setTextSize(2);
+    oled.setCursor(70, 0);
+    if (nav.title != "")
+    {
+      oled.print(nav.title.substring(0, min(7, (int)nav.title.length())));
+    }
+
+    // DURATION (right side, y=30, small)
+    oled.setTextSize(1);
+    if (nav.duration != "")
+    {
+      oled.setCursor(70, 30);
+      oled.print(nav.duration.substring(0, min(8, (int)nav.duration.length())));
+    }
+
+    // DISTANCE (right side, y=40, small)
+    if (nav.distance != "")
+    {
+      oled.setCursor(70, 40);
+      oled.print(nav.distance.substring(0, min(8, (int)nav.distance.length())));
+    }
+
+    // ICON (left side, 48x48) - Google Maps navigation arrow
+    int iconX = 0;
+    int iconY = 8;
+    oled.drawBitmap(iconX, iconY, nav.icon, 48, 48, SSD1306_WHITE);
+
+    // DIRECTIONS (bottom line)
+    oled.setCursor(0, 56);
+    if (nav.directions != "")
+    {
+      String dirText = nav.directions;
+      if (dirText.length() > 21)
+      {
+        oled.print(dirText.substring(0, 18));
+        oled.print("...");
+      }
+      else
+      {
+        oled.print(dirText);
+      }
+    }
+  }
+  // Show connection status when no navigation
+  else if (Chronos.isConnected())
+  {
+    // Normal display with larger time
+    oled.setTextSize(2);
+    oled.setCursor(0, 0);
+    String timeStr = Chronos.getHourZ() + ":" + (Chronos.getHourC() < 10 ? "0" : "") + String(Chronos.getHourC());
+    oled.print(timeStr);
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      oled.drawBitmap(80, 0, wifi_icon, 16, 16, SSD1306_WHITE);
     }
     else
     {
-      oled.println(lastPhoneMsg);
+      oled.drawBitmap(80, 0, wifi_off_icon, 16, 16, SSD1306_WHITE);
     }
-  }
-  else if (btConnected)
-  {
+
+    if (Chronos.isConnected())
+    {
+      oled.drawBitmap(104, 0, bt_icon, 16, 16, SSD1306_WHITE);
+    }
+    else
+    {
+      oled.drawBitmap(104, 0, bt_off_icon, 16, 16, SSD1306_WHITE);
+    }
+
+    oled.setTextSize(1);
+    oled.setCursor(0, 25);
+    oled.println("Chronos Connected!");
     oled.setCursor(0, 40);
-    oled.println("Ready for messages...");
+    oled.print("App: v");
+    oled.println(Chronos.getAppVersion());
+    oled.setCursor(0, 52);
+    oled.println("Start navigation...");
+  }
+  else
+  {
+    oled.setCursor(0, 25);
+    oled.println("Waiting for Chronos");
+    oled.setCursor(0, 40);
+    oled.println("Open Chronos app");
+    oled.setCursor(0, 52);
+    oled.println("Pair ESP32-Nav");
   }
 
   oled.display();
@@ -274,12 +363,9 @@ void setup()
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("\n=== ESP32 WiFi+BT Project ===");
-  Serial.print("WiFi SSID: ");
-  Serial.println(ssid ? ssid : "NOT SET");
+  Serial.println("\n=== ESP32 Chronos Navigation ===");
 
-  // Restore saved time from NVS (before WiFi)
-  Serial.println("\n=== Restoring Time from NVS ===");
+  // Restore saved time from NVS
   restoreSavedTime();
 
   // Initialize I2C
@@ -300,11 +386,8 @@ void setup()
       oled.setTextSize(1);
       oled.setTextColor(SSD1306_WHITE);
       oled.setCursor(0, 0);
-      oled.println("ESP32 Starting...");
-      oled.setCursor(0, 16);
-      oled.println("OLED Mode!");
+      oled.println("Chronos Starting...");
       oled.display();
-      delay(2000);
     }
     else
     {
@@ -325,15 +408,8 @@ void setup()
       lcd.backlight();
       lcd.clear();
       lcd.setCursor(0, 0);
-      lcd.print("ESP32 Starting..");
-      lcd.setCursor(0, 1);
-      lcd.print("LCD I2C Mode!");
-
+      lcd.print("Chronos Start..");
       Serial.println("LCD initialized!");
-      Serial.println("*** If you see backlight but NO text:");
-      Serial.println("1. SOLDER the 4 I2C module pins");
-      Serial.println("2. Or use jumper wires directly to I2C module pins");
-      Serial.println("3. Adjust contrast pot on I2C module (blue box with grey screw)");
       delay(2000);
     }
     else
@@ -343,7 +419,7 @@ void setup()
     }
   }
 
-  // Wi-Fi
+  // Wi-Fi (for NTP time sync)
   Serial.println("\n=== Connecting to WiFi ===");
   if (displayType == DISPLAY_LCD)
   {
@@ -366,10 +442,6 @@ void setup()
   {
     delay(500);
     Serial.print(".");
-    if (displayType == DISPLAY_LCD)
-    {
-      lcd.print(".");
-    }
     attempts++;
   }
 
@@ -379,72 +451,40 @@ void setup()
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
 
-    if (displayType == DISPLAY_LCD)
-    {
-      lcd.clear();
-      lcd.print("WiFi OK!");
-      lcd.setCursor(0, 1);
-      lcd.print(WiFi.localIP());
-    }
-    else if (displayType == DISPLAY_OLED)
-    {
-      oled.clearDisplay();
-      oled.setCursor(0, 0);
-      oled.println("WiFi Connected!");
-      oled.setCursor(0, 16);
-      oled.print("IP: ");
-      oled.println(WiFi.localIP());
-      oled.display();
-    }
-    delay(2000);
-
-    // Setup time
+    // Setup NTP time
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    Serial.println("Time sync started");
-
-    // Wait for time to be set
     delay(2000);
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo))
-    {
-      Serial.println("NTP time synced successfully!");
-      saveCurrentTime(); // Save to NVS
-    }
+    saveCurrentTime();
   }
   else
   {
-    Serial.println("\nWiFi FAILED");
-    if (displayType == DISPLAY_LCD)
-    {
-      lcd.clear();
-      lcd.print("WiFi FAILED!");
-    }
-    else if (displayType == DISPLAY_OLED)
-    {
-      oled.clearDisplay();
-      oled.setCursor(0, 0);
-      oled.println("WiFi FAILED!");
-      oled.display();
-    }
-    delay(2000);
+    Serial.println("\nWiFi FAILED (optional - Chronos will sync time)");
   }
 
-  // Bluetooth
-  SerialBT.begin("ESP32-WIFI-BT");
-  Serial.println("Bluetooth ready - pair with 'ESP32-WIFI-BT'");
+  // Start Chronos BLE
+  Serial.println("\n=== Starting Chronos BLE ===");
+  Chronos.begin();
+  Serial.println("Chronos BLE started!");
+  Serial.println("Open Chronos app and pair with 'ESP32-Nav'");
 
   if (displayType == DISPLAY_LCD)
   {
     lcd.clear();
-    lcd.print("BT: Ready!");
+    lcd.print("Chronos Ready!");
+    lcd.setCursor(0, 1);
+    lcd.print("Pair ESP32-Nav");
   }
   else if (displayType == DISPLAY_OLED)
   {
     oled.clearDisplay();
     oled.setCursor(0, 0);
-    oled.println("Bluetooth Ready!");
+    oled.println("Chronos BLE Ready!");
     oled.setCursor(0, 16);
-    oled.println("ESP32-WIFI-BT");
+    oled.println("ESP32-Nav");
+    oled.setCursor(0, 32);
+    oled.println("Open Chronos app");
+    oled.setCursor(0, 44);
+    oled.println("and pair device");
     oled.display();
   }
   delay(2000);
@@ -454,9 +494,26 @@ void setup()
 
 void loop()
 {
+  // Handle Chronos BLE (CRITICAL - must be called frequently)
+  Chronos.loop();
+
   // Update display every second
   if (millis() - lastDisplayUpdate > 1000)
   {
+    // Debug: Print raw navigation data
+    Navigation nav = Chronos.getNavigation();
+    if (Chronos.isConnected())
+    {
+      Serial.println("=== Nav Data ===");
+      Serial.printf("Active: %d | IsNav: %d\n", nav.active, nav.isNavigation);
+      Serial.printf("Title: %s\n", nav.title.c_str());
+      Serial.printf("ETA: %s\n", nav.eta.c_str());
+      Serial.printf("Duration: %s\n", nav.duration.c_str());
+      Serial.printf("Distance: %s\n", nav.distance.c_str());
+      Serial.printf("Directions: %s\n", nav.directions.c_str());
+      Serial.printf("Speed: %s\n", nav.speed.c_str());
+    }
+
     updateDisplay();
     lastDisplayUpdate = millis();
   }
@@ -466,55 +523,5 @@ void loop()
   {
     saveCurrentTime();
     lastTimeSave = millis();
-  }
-
-  // Send status message every 5 seconds if BT connected
-  if (SerialBT.hasClient() && (millis() - lastStatusMsg > 5000))
-  {
-    SerialBT.println("ESP32 READY");
-    lastStatusMsg = millis();
-  }
-
-  // PC Serial -> Phone BT
-  while (Serial.available())
-  {
-    char c = Serial.read();
-    if (c == '\r')
-      continue;
-    if (c == '\n')
-    {
-      if (pcBuffer.length() > 0)
-      {
-        SerialBT.println(pcBuffer);
-        Serial.println("PC->BT: " + pcBuffer);
-        pcBuffer = "";
-      }
-    }
-    else
-    {
-      pcBuffer += c;
-    }
-  }
-
-  // Phone BT -> PC Serial + Display Message
-  while (SerialBT.available())
-  {
-    char c = SerialBT.read();
-    if (c == '\r')
-      continue;
-    if (c == '\n')
-    {
-      if (phoneBuffer.length() > 0)
-      {
-        lastPhoneMsg = phoneBuffer;
-        Serial.println("PHONE MSG: " + phoneBuffer);
-        phoneBuffer = "";
-        updateDisplay(); // Update immediately when new message arrives
-      }
-    }
-    else
-    {
-      phoneBuffer += c;
-    }
   }
 }
