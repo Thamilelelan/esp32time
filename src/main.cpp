@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include <WiFi.h>
+// #include <WiFi.h>  // WiFi not needed - Chronos uses BLE and provides time sync
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <Adafruit_GFX.h>
@@ -10,17 +10,17 @@
 #include "credentials.h"
 
 //////////////////////
-// Wi-Fi settings (from credentials.h)
+// Wi-Fi settings (from credentials.h) - DISABLED (not needed for Chronos BLE)
 //////////////////////
-const char *ssid = WIFI_SSID;
-const char *password = WIFI_PASSWORD;
+// const char *ssid = WIFI_SSID;
+// const char *password = WIFI_PASSWORD;
 
 //////////////////////
-// Time settings
+// Time settings - DISABLED (Chronos provides time via BLE)
 //////////////////////
-const char *ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = 19800; // GMT+5:30 for India (5.5 hours * 3600)
-const int daylightOffset_sec = 0;
+// const char *ntpServer = "pool.ntp.org";
+// const long gmtOffset_sec = 19800; // GMT+5:30 for India (5.5 hours * 3600)
+// const int daylightOffset_sec = 0;
 
 //////////////////////
 // Display (Auto-detect LCD or OLED)
@@ -54,6 +54,12 @@ unsigned long lastTimeSave = 0;
 
 // NVS storage for persistent time
 Preferences preferences;
+
+//////////////////////
+// Boot Button Configuration
+//////////////////////
+#define BOOT_BUTTON_PIN 0    // GPIO0 is the BOOT button on ESP32
+#define LONG_PRESS_TIME 3000 // 3 seconds to power off
 
 //////////////////////
 // Icons for OLED (16x16 pixels)
@@ -208,9 +214,9 @@ void updateDisplayLCD()
 
   // Line 0: Time and connection status
   String timeStr = Chronos.getHourZ() + ":" + (Chronos.getHourC() < 10 ? "0" : "") + String(Chronos.getHourC());
-  snprintf(line0, sizeof(line0), "%s W:%s BT:%s",
+  snprintf(line1, sizeof(line1), "%s BLE:%s",
            timeStr.c_str(),
-           WiFi.status() == WL_CONNECTED ? "OK" : "X",
+           // WiFi.status() == WL_CONNECTED ? "OK" : "X",  // WiFi disabled
            Chronos.isConnected() ? "OK" : "X");
 
   // Line 1: Navigation or status
@@ -321,14 +327,15 @@ void updateDisplayOLED()
     String timeStr = Chronos.getHourZ() + ":" + (Chronos.getHourC() < 10 ? "0" : "") + String(Chronos.getHourC());
     oled.print(timeStr);
 
-    if (WiFi.status() == WL_CONNECTED)
-    {
-      oled.drawBitmap(80, 0, wifi_icon, 16, 16, SSD1306_WHITE);
-    }
-    else
-    {
-      oled.drawBitmap(80, 0, wifi_off_icon, 16, 16, SSD1306_WHITE);
-    }
+    // WiFi icon - DISABLED (not needed for Chronos BLE)
+    // if (WiFi.status() == WL_CONNECTED)
+    // {
+    //   oled.drawBitmap(80, 0, wifi_icon, 16, 16, SSD1306_WHITE);
+    // }
+    // else
+    // {
+    //   oled.drawBitmap(80, 0, wifi_off_icon, 16, 16, SSD1306_WHITE);
+    // }
 
     if (Chronos.isConnected())
     {
@@ -379,12 +386,135 @@ void updateDisplay()
   }
 }
 
+//////////////////////
+// Power Management Functions
+//////////////////////
+void enterDeepSleep()
+{
+  Serial.println("\n=== Entering Deep Sleep ===");
+  Serial.println("Press BOOT button to wake up");
+
+  // Save current time before sleep
+  saveCurrentTime();
+
+  // Show sleep message on display
+  if (displayType == DISPLAY_LCD)
+  {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Sleeping...");
+    lcd.setCursor(0, 1);
+    lcd.print("Press BOOT wake");
+    delay(1000);
+    lcd.noBacklight();
+  }
+  else if (displayType == DISPLAY_OLED)
+  {
+    oled.clearDisplay();
+    oled.setCursor(0, 20);
+    oled.setTextSize(1);
+    oled.println("  Going to sleep");
+    oled.setCursor(0, 35);
+    oled.println("Press BOOT to wake");
+    oled.display();
+    delay(1000);
+    oled.clearDisplay();
+    oled.display();
+  }
+
+  delay(500);
+
+  // Configure wake up source (BOOT button on GPIO0)
+  // LOW level will wake up the ESP32
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+
+  // Enter deep sleep
+  esp_deep_sleep_start();
+}
+
+bool checkForPowerOff()
+{
+  static unsigned long buttonPressStart = 0;
+  static bool buttonWasPressed = false;
+
+  bool buttonPressed = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+
+  if (buttonPressed && !buttonWasPressed)
+  {
+    // Button just pressed
+    buttonPressStart = millis();
+    buttonWasPressed = true;
+  }
+  else if (!buttonPressed && buttonWasPressed)
+  {
+    // Button just released - check if it was a short press
+    unsigned long pressDuration = millis() - buttonPressStart;
+    buttonWasPressed = false;
+
+    // Short press (less than 1 second) - go to sleep
+    if (pressDuration < 1000)
+    {
+      Serial.println("Short press detected - entering sleep mode");
+      return true;
+    }
+  }
+  else if (buttonPressed && buttonWasPressed)
+  {
+    // Button is being held
+    unsigned long pressDuration = millis() - buttonPressStart;
+
+    if (pressDuration >= LONG_PRESS_TIME)
+    {
+      // Long press detected - power off
+      Serial.println("Long press detected - entering sleep mode");
+      return true;
+    }
+  }
+
+  return false;
+}
+
 void setup()
 {
   Serial.begin(115200);
   delay(1000);
 
   Serial.println("\n=== ESP32 Chronos Navigation ===");
+
+  // Check wake up reason
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0)
+  {
+    Serial.println("Woke up from BOOT button press");
+  }
+  else if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED)
+  {
+    Serial.println("First boot - checking if BOOT button pressed");
+
+    // Configure boot button as input with pull-up
+    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+    delay(100);
+
+    // Check if BOOT button is NOT pressed on first power-up
+    if (digitalRead(BOOT_BUTTON_PIN) == HIGH)
+    {
+      Serial.println("BOOT button not pressed - entering sleep mode");
+      Serial.println("Press and hold BOOT button during power-up to start");
+
+      // Go to sleep immediately - user must press BOOT to wake
+      esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+      delay(100);
+      esp_deep_sleep_start();
+    }
+    else
+    {
+      Serial.println("BOOT button pressed - starting normally");
+    }
+  }
+
+  // Configure boot button for long-press shutdown detection
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
   // Restore saved time from NVS
   restoreSavedTime();
@@ -440,47 +570,47 @@ void setup()
     }
   }
 
-  // Wi-Fi (for NTP time sync)
-  Serial.println("\n=== Connecting to WiFi ===");
-  if (displayType == DISPLAY_LCD)
-  {
-    lcd.clear();
-    lcd.print("WiFi connect...");
-  }
-  else if (displayType == DISPLAY_OLED)
-  {
-    oled.clearDisplay();
-    oled.setCursor(0, 0);
-    oled.println("WiFi connecting...");
-    oled.display();
-  }
+  // Wi-Fi (for NTP time sync) - DISABLED (Chronos provides time via BLE)
+  // Serial.println("\n=== Connecting to WiFi ===");
+  // if (displayType == DISPLAY_LCD)
+  // {
+  //   lcd.clear();
+  //   lcd.print("WiFi connect...");
+  // }
+  // else if (displayType == DISPLAY_OLED)
+  // {
+  //   oled.clearDisplay();
+  //   oled.setCursor(0, 0);
+  //   oled.println("WiFi connecting...");
+  //   oled.display();
+  // }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  // WiFi.mode(WIFI_STA);
+  // WiFi.begin(ssid, password);
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20)
-  {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
+  // int attempts = 0;
+  // while (WiFi.status() != WL_CONNECTED && attempts < 20)
+  // {
+  //   delay(500);
+  //   Serial.print(".");
+  //   attempts++;
+  // }
 
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    Serial.println("\nWiFi connected!");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
+  // if (WiFi.status() == WL_CONNECTED)
+  // {
+  //   Serial.println("\nWiFi connected!");
+  //   Serial.print("IP: ");
+  //   Serial.println(WiFi.localIP());
 
-    // Setup NTP time
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    delay(2000);
-    saveCurrentTime();
-  }
-  else
-  {
-    Serial.println("\nWiFi FAILED (optional - Chronos will sync time)");
-  }
+  //   // Setup NTP time
+  //   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  //   delay(2000);
+  //   saveCurrentTime();
+  // }
+  // else
+  // {
+  //   Serial.println("\nWiFi FAILED (optional - Chronos will sync time)");
+  // }
 
   // Start Chronos BLE
   Serial.println("\n=== Starting Chronos BLE ===");
@@ -515,6 +645,12 @@ void setup()
 
 void loop()
 {
+  // Check for long press on BOOT button to power off
+  if (checkForPowerOff())
+  {
+    enterDeepSleep();
+  }
+
   // Handle Chronos BLE (CRITICAL - must be called frequently)
   Chronos.loop();
 
