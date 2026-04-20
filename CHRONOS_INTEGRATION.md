@@ -13,6 +13,11 @@ This ESP32 project receives navigation data from the Chronos app via **Bluetooth
 - ✅ Connection status icons (WiFi, Bluetooth)
 - ✅ Simple pairing - just connect and go!
 
+## Demo Phone UI
+
+Open `demo.html` in a browser to preview a phone-style navigation screen and the
+JSON payload sent to the ESP32.
+
 ## Hardware Requirements
 
 - ESP32 development board
